@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>zzzzzmeng 的技术博客</title>
+    <meta name="description" content="记录大模型、推理系统与工程实践。">
+    <link rel="stylesheet" href="./assets/style.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="nav" aria-label="主导航">
+        <a class="brand" href="./">zzzzzmeng</a>
+        <div class="nav-links">
+          <a href="./">文章</a>
+          <a href="https://github.com/zzzzzmeng">GitHub</a>
+        </div>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <p class="eyebrow">LLM / Systems / Notes</p>
+        <h1>记录大模型推理、Attention 机制和工程实践。</h1>
+        <p class="lead">把学习过程里真正绕人的概念拆开讲清楚：从 shape、cache、kernel 到系统优化。</p>
+      </section>
+
+      <section class="container" aria-labelledby="posts-title">
+        <h2 id="posts-title">最新文章</h2>
+        <div class="post-list">
+          <a class="post-card" href="./posts/attention-shape.html">
+            <h2>大模型 Attention 机制中的 Shape 变化详解</h2>
+            <p class="meta">2026-05-27 · Transformer · Attention · KV Cache</p>
+            <p>从输入 hidden states 到 Q/K/V、Multi-Head Attention、causal mask、KV Cache 和 GQA/MQA，完整梳理 Attention 中的张量形状变化。</p>
+          </a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>© 2026 zzzzzmeng</span>
+    </footer>
+  </body>
+</html>

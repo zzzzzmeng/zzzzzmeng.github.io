@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>大模型 Attention 机制中的 Shape 变化详解 | zzzzzmeng</title>
+    <meta name="description" content="从 Decoder-only 大模型出发，解释 Attention 中 Q、K、V、Multi-Head Attention、KV Cache、GQA/MQA 的 shape 变化。">
+    <link rel="stylesheet" href="../assets/style.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="nav" aria-label="主导航">
+        <a class="brand" href="../">zzzzzmeng</a>
+        <div class="nav-links">
+          <a href="../">文章</a>
+          <a href="https://github.com/zzzzzmeng">GitHub</a>
+        </div>
+      </nav>
+    </header>
+
+    <main class="article">
+      <article>
+        <header class="article-header">
+          <p class="eyebrow">Transformer · Attention · KV Cache</p>
+          <h1>大模型 Attention 机制中的 Shape 变化详解</h1>
+          <p class="meta">2026-05-27</p>
+        </header>
+
+        <p>理解 Transformer 的 Attention 机制时，很多人一开始不是卡在公式，而是卡在张量 shape 上。</p>
+
+<pre><code>Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V</code></pre>
+
+        <p>公式看起来很短，但真正写代码或读大模型源码时，会看到各种 <code>view</code>、<code>reshape</code>、<code>transpose</code>、<code>permute</code>，再加上 batch、head、sequence length、KV Cache、GQA/MQA，很容易绕晕。</p>
+
+        <p>这篇文章从 Decoder-only 大语言模型的 Self-Attention 出发，按计算流程解释 Attention 中的 shape 是如何变化的。</p>
+
+        <h2>1. 输入张量的基本形状</h2>
+
+        <p>假设输入 hidden states 是：</p>
+
+<pre><code>X.shape = [B, T, D]</code></pre>
+
+        <p>其中：</p>
+
+<pre><code>B = batch size
+T = sequence length
+D = hidden size，也叫 model dimension</code></pre>
+
+        <p>例如：</p>
+
+<pre><code>B = 2
+T = 5
+D = 4096</code></pre>
+
+        <p>表示一个 batch 里有 2 条样本，每条样本有 5 个 token，每个 token 用一个 4096 维向量表示。</p>
+
+        <p>在 Transformer Block 中，Attention 层会接收这个 <code>[B, T, D]</code> 的输入，然后输出同样 shape 的张量：</p>
+
+<pre><code>输入: [B, T, D]
+输出: [B, T, D]</code></pre>
+
+        <p>中间的关键，就是把 <code>D</code> 拆成多个 attention head。</p>
+
+        <h2>2. 从输入投影出 Q、K、V</h2>
+
+        <p>Self-Attention 会先通过三个线性层，把输入 <code>X</code> 投影成 Query、Key、Value：</p>
+
+<pre><code>Q = X @ Wq
+K = X @ Wk
+V = X @ Wv</code></pre>
+
+        <p>在标准 Multi-Head Attention 中：</p>
+
+<pre><code>Wq.shape = [D, H * Dh]
+Wk.shape = [D, H * Dh]
+Wv.shape = [D, H * Dh]</code></pre>
+
+        <p>其中：</p>
+
+<pre><code>H  = num_heads
+Dh = head_dim
+D  = H * Dh</code></pre>
+
+        <p>所以投影后的 shape 通常仍然是：</p>
+
+<pre><code>Q.shape = [B, T, D]
+K.shape = [B, T, D]
+V.shape = [B, T, D]</code></pre>
+
+        <p>比如 <code>D = 4096</code>，<code>H = 32</code>，那么：</p>
+
+<pre><code>Dh = 4096 / 32 = 128</code></pre>
+
+        <p>也就是说，4096 维会被拆成 32 个 head，每个 head 负责 128 维。</p>
+
+        <h2>3. 拆分 Attention Head</h2>
+
+        <p>接下来要把最后一维 <code>D</code> 拆成：</p>
+
+<pre><code>H * Dh</code></pre>
+
+        <p>所以：</p>
+
+<pre><code>Q: [B, T, D] -> [B, T, H, Dh]
+K: [B, T, D] -> [B, T, H, Dh]
+V: [B, T, D] -> [B, T, H, Dh]</code></pre>
+
+        <p>为了方便后续做矩阵乘法，通常还会交换 <code>T</code> 和 <code>H</code> 两个维度：</p>
+
+<pre><code>Q: [B, T, H, Dh] -> [B, H, T, Dh]
+K: [B, T, H, Dh] -> [B, H, T, Dh]
+V: [B, T, H, Dh] -> [B, H, T, Dh]</code></pre>
+
+        <p>这个 <code>[B, H, T, Dh]</code> 是 Attention 计算中最常见的形状。</p>
+
+        <h2>4. 计算 Attention Score</h2>
+
+        <p>Attention score 的计算是：</p>
+
+<pre><code>scores = Q @ K^T / sqrt(Dh)</code></pre>
+
+        <p>此时：</p>
+
+<pre><code>Q.shape = [B, H, T, Dh]
+K.shape = [B, H, T, Dh]</code></pre>
+
+        <p>矩阵乘法时，需要把 K 的最后两个维度转置：</p>
+
+<pre><code>K^T.shape = [B, H, Dh, T]</code></pre>
+
+        <p>于是：</p>
+
+<pre><code>scores.shape
+= [B, H, T, Dh] @ [B, H, Dh, T]
+= [B, H, T, T]</code></pre>
+
+        <p>这里的 <code>[T, T]</code> 很重要。它表示序列中每个 token 对每个 token 的注意力分数：</p>
+
+<pre><code>scores[b, h, i, j]</code></pre>
+
+        <p>表示第 <code>b</code> 个样本、第 <code>h</code> 个 head 中，第 <code>i</code> 个 query token 对第 <code>j</code> 个 key token 的注意力分数。</p>
+
+        <h2>5. Causal Mask 的 Shape</h2>
+
+        <p>Decoder-only 大模型是自回归模型，生成当前位置时不能看到未来 token。因此要加 causal mask。</p>
+
+        <p>mask 常见 shape 是：</p>
+
+<pre><code>mask.shape = [1, 1, T, T]</code></pre>
+
+        <p>或者：</p>
+
+<pre><code>mask.shape = [B, 1, T, T]</code></pre>
+
+        <p>它会 broadcast 到 attention score 的 shape：</p>
+
+<pre><code>scores.shape = [B, H, T, T]</code></pre>
+
+        <p>未来位置会被加上一个极小值，比如 <code>-inf</code>。这样经过 softmax 后，未来 token 的注意力权重就会变成接近 0。</p>
+
+        <h2>6. Softmax 得到注意力权重</h2>
+
+        <p>对 score 的最后一维做 softmax：</p>
+
+<pre><code>attn_weights = softmax(scores, dim=-1)</code></pre>
+
+        <p>shape 不变：</p>
+
+<pre><code>attn_weights.shape = [B, H, T, T]</code></pre>
+
+        <p>最后一维代表当前 query token 对所有 key token 的权重分布。也就是说，对固定的 <code>b, h, i</code>：</p>
+
+<pre><code>attn_weights[b, h, i, :]</code></pre>
+
+        <p>是一组长度为 <code>T</code> 的概率分布，表示第 <code>i</code> 个 token 该关注前文中哪些 token。</p>
+
+        <h2>7. Attention 权重乘以 V</h2>
+
+        <p>接下来用注意力权重聚合 Value：</p>
+
+<pre><code>context = attn_weights @ V</code></pre>
+
+        <p>其中：</p>
+
+<pre><code>attn_weights.shape = [B, H, T, T]
+V.shape            = [B, H, T, Dh]</code></pre>
+
+        <p>矩阵乘法后：</p>
+
+<pre><code>context.shape
+= [B, H, T, T] @ [B, H, T, Dh]
+= [B, H, T, Dh]</code></pre>
+
+        <p>这表示每个 batch、每个 head、每个 token 都得到了一个新的 <code>Dh</code> 维表示。</p>
+
+        <h2>8. 合并 Head，回到 Hidden Size</h2>
+
+        <p>Attention 每个 head 都会得到自己的输出：</p>
+
+<pre><code>context.shape = [B, H, T, Dh]</code></pre>
+
+        <p>接下来要把多个 head 拼回 hidden size：</p>
+
+<pre><code>[B, H, T, Dh]
+-> [B, T, H, Dh]
+-> [B, T, H * Dh]</code></pre>
+
+        <p>因为：</p>
+
+<pre><code>H * Dh = D</code></pre>
+
+        <p>所以：</p>
+
+<pre><code>context.shape = [B, T, D]</code></pre>
+
+        <p>最后再经过输出投影：</p>
+
+<pre><code>Y = context @ Wo</code></pre>
+
+        <p>其中：</p>
+
+<pre><code>Wo.shape = [D, D]
+Y.shape  = [B, T, D]</code></pre>
+
+        <p>这就是 Attention 层最终输出的 shape。</p>
+
+        <h2>9. 标准 Attention 的完整 Shape 流程</h2>
+
+<pre><code>输入:
+X: [B, T, D]
+
+线性投影:
+Q: [B, T, D]
+K: [B, T, D]
+V: [B, T, D]
+
+拆 head:
+Q: [B, T, H, Dh]
+K: [B, T, H, Dh]
+V: [B, T, H, Dh]
+
+转置:
+Q: [B, H, T, Dh]
+K: [B, H, T, Dh]
+V: [B, H, T, Dh]
+
+计算 score:
+Q @ K^T:
+[B, H, T, Dh] @ [B, H, Dh, T]
+= [B, H, T, T]
+
+softmax:
+attn_weights: [B, H, T, T]
+
+乘 V:
+[B, H, T, T] @ [B, H, T, Dh]
+= [B, H, T, Dh]
+
+合并 head:
+[B, H, T, Dh]
+-> [B, T, H, Dh]
+-> [B, T, D]
+
+输出投影:
+Y: [B, T, D]</code></pre>
+
+        <p>一句话总结：</p>
+
+<pre><code>Q: [B, H, Tq, Dh]
+K: [B, H, Tk, Dh]
+V: [B, H, Tk, Dh]
+
+Q @ K^T -> [B, H, Tq, Tk]
+softmax 后乘 V -> [B, H, Tq, Dh]
+最后合并 head -> [B, Tq, D]</code></pre>
+
+        <p>训练或 prefill 阶段通常有 <code>Tq = Tk = T</code>。decode 阶段使用 KV Cache 时，通常是 <code>Tq = 1</code>，<code>Tk = T_past + 1</code>。</p>
+
+        <h2>10. KV Cache 下的 Shape</h2>
+
+        <p>大模型推理生成文本时，通常一次只生成一个 token。</p>
+
+        <p>假设历史长度是 <code>T_past</code>，当前新输入 token 长度是 <code>T_new = 1</code>。</p>
+
+        <p>当前输入：</p>
+
+<pre><code>X_new.shape = [B, 1, D]</code></pre>
+
+        <p>计算当前 token 的 Q、K、V：</p>
+
+<pre><code>Q_new.shape = [B, H, 1, Dh]
+K_new.shape = [B, H, 1, Dh]
+V_new.shape = [B, H, 1, Dh]</code></pre>
+
+        <p>历史缓存里已经有：</p>
+
+<pre><code>K_cache.shape = [B, H, T_past, Dh]
+V_cache.shape = [B, H, T_past, Dh]</code></pre>
+
+        <p>把新 token 的 K、V 拼进去：</p>
+
+<pre><code>K_all.shape = [B, H, T_past + 1, Dh]
+V_all.shape = [B, H, T_past + 1, Dh]</code></pre>
+
+        <p>然后当前 token 的 Query 去查询所有历史 Key：</p>
+
+<pre><code>scores = Q_new @ K_all^T</code></pre>
+
+        <p>shape 是：</p>
+
+<pre><code>[B, H, 1, Dh] @ [B, H, Dh, T_past + 1]
+= [B, H, 1, T_past + 1]</code></pre>
+
+        <p>再乘以 V：</p>
+
+<pre><code>context = attn_weights @ V_all</code></pre>
+
+        <p>shape 是：</p>
+
+<pre><code>[B, H, 1, T_past + 1] @ [B, H, T_past + 1, Dh]
+= [B, H, 1, Dh]</code></pre>
+
+        <p>最后合并 head：</p>
+
+<pre><code>[B, H, 1, Dh]
+-> [B, 1, H, Dh]
+-> [B, 1, D]</code></pre>
+
+        <p>这就是每生成一个 token 时的 Attention shape。</p>
+
+        <p>KV Cache 的核心价值也体现在这里：当前 token 只需要计算自己的 Q、K、V，然后用当前 Q 去查询缓存中的历史 K/V，不需要每一步都重新计算整段上下文。</p>
+
+        <h2>11. GQA 和 MQA 的 Shape 差异</h2>
+
+        <p>很多现代大模型并不使用标准 MHA，而是使用 GQA 或 MQA 来减少 KV Cache 显存占用。</p>
+
+        <p>标准 MHA 中：</p>
+
+<pre><code>num_q_heads = num_kv_heads = H</code></pre>
+
+        <p>因此：</p>
+
+<pre><code>Q: [B, H, T, Dh]
+K: [B, H, T, Dh]
+V: [B, H, T, Dh]</code></pre>
+
+        <p>GQA 中：</p>
+
+<pre><code>num_q_heads > num_kv_heads</code></pre>
+
+        <p>例如：</p>
+
+<pre><code>num_q_heads  = 32
+num_kv_heads = 8</code></pre>
+
+        <p>则：</p>
+
+<pre><code>Q: [B, 32, T, Dh]
+K: [B, 8,  T, Dh]
+V: [B, 8,  T, Dh]</code></pre>
+
+        <p>做 attention 时，多个 Q head 会共享同一组 K/V head。实现上可以把 K/V repeat 到 Q head 数：</p>
+
+<pre><code>K: [B, 8, T, Dh] -> [B, 32, T, Dh]
+V: [B, 8, T, Dh] -> [B, 32, T, Dh]</code></pre>
+
+        <p>不过在高性能推理 kernel 中，不一定真的物理复制，可能是在计算逻辑上完成共享。</p>
+
+        <p>MQA 是 GQA 的极端情况：</p>
+
+<pre><code>num_kv_heads = 1</code></pre>
+
+        <p>也就是：</p>
+
+<pre><code>Q: [B, H, T, Dh]
+K: [B, 1, T, Dh]
+V: [B, 1, T, Dh]</code></pre>
+
+        <p>所有 Q heads 共享同一组 K/V。这能显著减少 KV Cache 的大小，尤其在长上下文推理时非常重要。</p>
+
+        <h2>12. PyTorch 风格伪代码</h2>
+
+<pre><code>import math
+import torch
+
+B, T, D = x.shape
+H = num_heads
+Dh = D // H
+
+q = q_proj(x)  # [B, T, D]
+k = k_proj(x)  # [B, T, D]
+v = v_proj(x)  # [B, T, D]
+
+q = q.view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
+k = k.view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
+v = v.view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
+
+scores = q @ k.transpose(-2, -1)         # [B, H, T, T]
+scores = scores / math.sqrt(Dh)
+scores = scores + causal_mask            # broadcast 到 [B, H, T, T]
+
+attn = torch.softmax(scores, dim=-1)     # [B, H, T, T]
+
+out = attn @ v                           # [B, H, T, Dh]
+out = out.transpose(1, 2).contiguous()   # [B, T, H, Dh]
+out = out.view(B, T, D)                  # [B, T, D]
+
+out = o_proj(out)                        # [B, T, D]</code></pre>
+
+        <p>这里最容易出错的是 <code>transpose</code> 后再 <code>view</code>。因为 <code>transpose</code> 会改变张量内存布局，所以实际 PyTorch 代码里常常需要：</p>
+
+<pre><code>out = out.transpose(1, 2).contiguous().view(B, T, D)</code></pre>
+
+        <p>或者使用：</p>
+
+<pre><code>out = out.transpose(1, 2).reshape(B, T, D)</code></pre>
+
+        <h2>13. 总结</h2>
+
+        <p>Attention 的 shape 变化可以抓住一条主线：</p>
+
+<pre><code>[B, T, D]
+-> [B, T, H, Dh]
+-> [B, H, T, Dh]
+-> [B, H, T, T]
+-> [B, H, T, Dh]
+-> [B, T, D]</code></pre>
+
+        <p>其中：</p>
+
+<pre><code>D = H * Dh</code></pre>
+
+        <p>标准训练或 prefill 时：</p>
+
+<pre><code>Q: [B, H, T, Dh]
+K: [B, H, T, Dh]
+V: [B, H, T, Dh]
+scores: [B, H, T, T]</code></pre>
+
+        <p>带 KV Cache 的 decode 阶段：</p>
+
+<pre><code>Q_new: [B, H, 1, Dh]
+K_all: [B, H, T_past + 1, Dh]
+V_all: [B, H, T_past + 1, Dh]
+scores: [B, H, 1, T_past + 1]</code></pre>
+
+        <p>如果把 Attention 理解成“当前 token 用 Query 去查询上下文中的 Key，再根据权重聚合 Value”，那么 shape 也会变得清晰：</p>
+
+<pre><code>Q 决定我要查什么
+K 决定每个位置能被如何匹配
+V 提供真正要聚合的信息</code></pre>
+
+        <p>而所有 shape 变化，本质上都是为了让每个 head 能独立完成这件事，再把多个 head 的结果拼回模型的 hidden size。</p>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <span>© 2026 zzzzzmeng</span>
+    </footer>
+  </body>
+</html>
