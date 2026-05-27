@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>vLLM 分布式策略 PP、TP、DP、SP、PCP、DCP 实现原理 | zzzzzmeng</title>
+    <meta name="description" content="结合 vLLM 源码，讲解 Pipeline Parallelism、Tensor Parallelism、Data Parallelism、Sequence Parallelism、Prefill Context Parallelism 和 Decode Context Parallelism 的实现原理。">
+    <link rel="stylesheet" href="../assets/style.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="nav" aria-label="主导航">
+        <a class="brand" href="../">zzzzzmeng</a>
+        <div class="nav-links">
+          <a href="../">文章</a>
+          <a href="https://github.com/zzzzzmeng">GitHub</a>
+        </div>
+      </nav>
+    </header>
+
+    <main class="article">
+      <article>
+        <header class="article-header">
+          <p class="eyebrow">vLLM · Distributed Inference · Parallelism</p>
+          <h1>vLLM 分布式策略 PP、TP、DP、SP、PCP、DCP 实现原理</h1>
+          <p class="meta">2026-05-27</p>
+        </header>
+
+        <p>vLLM 的分布式推理里有好几种并行策略：PP、TP、DP、SP、PCP、DCP。它们名字相近，但切分对象完全不同。有的切模型权重，有的切模型层，有的切请求，有的切 token 序列，有的专门服务 prefill 或 decode 阶段。</p>
+
+        <p>如果先抓住一句话，会清楚很多：</p>
+
+<pre><code>TP  切层内矩阵
+PP  切模型层
+DP  复制模型副本切请求
+SP  在 TP 内沿 token 维切激活或 MoE 输入
+PCP 切 prefill 阶段的长上下文
+DCP 切 decode 阶段的历史上下文，复用 TP ranks</code></pre>
+
+        <h2>1. vLLM 的 rank 网格</h2>
+
+        <p>在 vLLM 当前实现里，核心进程组由 <code>ParallelConfig</code> 和 <code>initialize_model_parallel()</code> 建立。可以把全局 rank 看成一个多维网格：</p>
+
+<pre><code>ExternalDP x DP x PP x PCP x TP</code></pre>
+
+        <p>其中：</p>
+
+<pre><code>world_size = PP * PCP * TP
+world_size_across_dp = DP * PP * PCP * TP</code></pre>
+
+        <p>注意，<code>DCP</code> 不增加 <code>world_size</code>。DCP 是在 TP group 内部复用 GPU，把一个 TP group 按 <code>decode_context_parallel_size</code> 再切成更小的 DCP group。</p>
+
+        <p>vLLM 初始化时会把全局 rank reshape 成：</p>
+
+<pre><code>all_ranks = torch.arange(world_size).reshape(
+    ExternalDP,
+    DP,
+    PP,
+    PCP,
+    TP,
+)</code></pre>
+
+        <p>然后通过不同维度的 transpose 和 reshape 构造 TP、PP、PCP、DP、DCP 进程组。</p>
+
+<pre><code>例：DP=2, PP=2, PCP=1, TP=4, DCP=2
+
+DP0:
+  PP0: [r0 r1 r2 r3]      一个 TP group
+        [r0 r1] [r2 r3]   两个 DCP group
+  PP1: [r4 r5 r6 r7]
+
+DP1:
+  PP0: [r8 r9 r10 r11]
+  PP1: [r12 r13 r14 r15]
+
+DP group 示例:
+  固定 PP0 + TP0: [r0, r8]
+
+PP group 示例:
+  固定 DP0 + TP0: [r0, r4]</code></pre>
+
+        <h2>2. TP：Tensor Parallelism</h2>
+
+        <p>TP 是层内张量并行。它把一个 transformer 层里的线性层权重切到多个 GPU 上。vLLM 里最典型的是 <code>ColumnParallelLinear</code> 和 <code>RowParallelLinear</code>。</p>
+
+        <h3>ColumnParallelLinear</h3>
+
+        <p>Column parallel 按输出维切权重矩阵：</p>
+
+<pre><code>Y = X A
+A = [A0, A1, ..., A(tp-1)]
+
+rank0: Y0 = X A0
+rank1: Y1 = X A1
+rank2: Y2 = X A2
+rank3: Y3 = X A3</code></pre>
+
+        <p>如果后续需要完整输出，就对 TP group 做 <code>all_gather</code>：</p>
+
+<pre><code>输入 X
+  |
+  +--> GPU0: A0 -> Y0
+  +--> GPU1: A1 -> Y1
+  +--> GPU2: A2 -> Y2
+  +--> GPU3: A3 -> Y3
+             |
+        all_gather 可选
+             v
+        [Y0 Y1 Y2 Y3]</code></pre>
+
+        <h3>RowParallelLinear</h3>
+
+        <p>Row parallel 按输入维切权重矩阵，同时输入也按最后一维切开：</p>
+
+<pre><code>X = [X0, X1, ..., X(tp-1)]
+A = [A0; A1; ...; A(tp-1)]
+
+rank_i: Yi = Xi Ai</code></pre>
+
+        <p>每个 rank 得到 partial output，最后通过 <code>all_reduce(sum)</code> 得到完整结果：</p>
+
+<pre><code>GPU0: X0 @ A0 -> partial Y0
+GPU1: X1 @ A1 -> partial Y1
+GPU2: X2 @ A2 -> partial Y2
+GPU3: X3 @ A3 -> partial Y3
+              |
+          all_reduce(sum)
+              v
+              Y</code></pre>
+
+        <p>所以 TP 的本质是：用通信换显存，把单层权重和中间结果分摊到多张 GPU 上。</p>
+
+        <h2>3. PP：Pipeline Parallelism</h2>
+
+        <p>PP 是层间并行。它不切单层矩阵，而是按 transformer block 的深度切模型。</p>
+
+<pre><code>请求输入
+  |
+PP rank 0: embedding + layers 0..N
+  |
+  | hidden_states / IntermediateTensors
+  v
+PP rank 1: layers N+1..M
+  |
+  v
+PP rank 2: layers M+1..K
+  |
+  v
+最后一个 PP rank: logits + sampling</code></pre>
+
+        <p>在 vLLM V1 的执行路径里，非最后 PP rank 会返回 <code>IntermediateTensors</code>，最后一个 PP rank 才计算 logits 和采样。异步调度时，最后一个 PP rank 采样出的 token 还会广播回前面的 PP rank，使下一轮 decode 输入保持一致。</p>
+
+        <p>PP 适合模型太深、跨节点部署，或者 TP 已经不适合继续增大的场景。代价是 stage 之间要传 hidden states，并且 pipeline 气泡会影响利用率。</p>
+
+        <h2>4. DP：Data Parallelism</h2>
+
+        <p>DP 是请求级或批次级并行。每个 DP rank 有一套完整的模型并行副本，这套副本内部仍然可以用 TP、PP、PCP。</p>
+
+<pre><code>入口请求流
+   |
+Load Balancer / vLLM DP coordinator
+   |
+   +--> DP rank 0: 一套 PP * PCP * TP workers
+   +--> DP rank 1: 一套 PP * PCP * TP workers
+   +--> DP rank 2: 一套 PP * PCP * TP workers</code></pre>
+
+        <p>对 dense 模型来说，DP 主要用于扩吞吐：不同 DP rank 处理不同请求。对 MoE 模型来说，vLLM 还会让 expert parallel 和 DP 组合，MoE expert 的切分范围可能变成 <code>TP * DP</code>，甚至再加上 PCP。</p>
+
+        <p>DP group 还有一个容易忽略的作用：同步执行形态。比如 CUDA Graph、microbatch、DBO 等要求多个 DP rank 采用一致的 padding 和 batch 切分方式，vLLM 会在 DP ranks 间 all-reduce token 数、是否 microbatch、cudagraph mode 等信息，避免 collective pattern 不一致导致 hang。</p>
+
+        <h2>5. SP：Sequence Parallelism</h2>
+
+        <p>vLLM 里的 SP 有两类用法。</p>
+
+        <h3>编译期 SP</h3>
+
+        <p>编译期的 Sequence Parallelism pass 依赖 TP。它会把某些 TP 内的 <code>all_reduce + RMSNorm</code> 模式改写成 <code>reduce_scatter + local RMSNorm + all_gather</code>。</p>
+
+<pre><code>原始:
+Input -> AllReduce(TP) -> RMSNorm -> Output
+
+改写:
+Input -> ReduceScatter(TP, dim=token)
+      -> local RMSNorm
+      -> AllGather(TP)
+      -> Output</code></pre>
+
+        <p>图示：</p>
+
+<pre><code>原始:
+GPU0/GPU1 都拿完整 token
+       |
+   all_reduce
+       |
+    RMSNorm(完整 token)
+
+SP 后:
+       |
+ reduce_scatter 按 token 切
+       |
+ GPU0: tokens 0..n/2 做 RMSNorm
+ GPU1: tokens n/2..n 做 RMSNorm
+       |
+ all_gather 拼回</code></pre>
+
+        <p>这个 pass 本身更像是在创造后续 fusion 的机会，例如 GEMM + ReduceScatter、AllGather + GEMM。它通常要求 <code>TP &gt; 1</code>、启用编译、hidden size 和 token 数达到阈值。</p>
+
+        <h3>MoE SP</h3>
+
+        <p>MoE 场景里还有一种 sequence parallel。TP 的 attention 或 o_proj all-reduce 后，每个 TP rank 上会拿到复制的 token。如果直接送进 expert parallel，会造成重复 dispatch 和重复 expert 计算。</p>
+
+        <p>因此 vLLM 在一些 MoE 条件下使用 <code>sequence_parallel_chunk()</code> 沿 token 维切 hidden states，让不同 TP rank 处理不同 token，再做 expert dispatch/combine。</p>
+
+        <h2>6. PCP：Prefill Context Parallelism</h2>
+
+        <p>PCP 是 prefill 阶段的上下文并行。它会增加 worker 数，因此进入 <code>world_size = PP * PCP * TP</code>。</p>
+
+        <p>prefill 阶段 prompt 很长，attention 需要处理大量上下文 token。PCP 的直觉就是把长上下文沿 sequence/context 维切到多个 PCP rank。</p>
+
+<pre><code>长 prompt tokens:
+[t0 t1 t2 t3 t4 t5 t6 t7]
+
+PCP=2:
+pcp rank0: [t0 t1 t2 t3]
+pcp rank1: [t4 t5 t6 t7]</code></pre>
+
+        <p>PCP 对 attention backend 有要求。vLLM 会检查当 <code>prefill_context_parallel_size &gt; 1</code> 时，attention implementation 必须声明支持 PCP。</p>
+
+        <p>PCP 和 KV cache 的布局由 <code>cp_kv_cache_interleave_size</code> 控制。vLLM 把 PCP 和 DCP 合在一个总 CP rank 里看：</p>
+
+<pre><code>total_cp_rank = pcp_rank * dcp_world_size + dcp_rank
+total_cp_world_size = pcp_world_size * dcp_world_size</code></pre>
+
+        <p>当 <code>interleave_size=1</code> 时，token 会近似按 token 粒度轮转存放：</p>
+
+<pre><code>token i -> total_cp_rank = i % total_cp_world_size</code></pre>
+
+        <p>在 MoE 中，PCP 还需要对 hidden states 和 router logits 做 gather/scatter：先 <code>pcp_group.all_gather()</code> 拼上下文，再走 expert，最后 <code>pcp_group.reduce_scatter()</code> 切回去。</p>
+
+        <h2>7. DCP：Decode Context Parallelism</h2>
+
+        <p>DCP 是 decode 阶段的上下文并行。它和 PCP 最大的区别是：DCP 不增加 worker 数，而是在 TP group 内复用 GPU。</p>
+
+<pre><code>要求:
+TP % DCP == 0
+
+例:
+TP=4, DCP=2
+
+TP group: [r0 r1 r2 r3]
+DCP groups:
+  [r0 r1]
+  [r2 r3]</code></pre>
+
+        <p>decode 阶段每步 query 通常很短，常见是 1 个 token，但历史 KV 很长。DCP 把历史 context/KV 切给多个 rank，每个 rank 对自己那段 KV 做局部 attention。</p>
+
+<pre><code>decode query q
+   |
+   +--> DCP rank0: attend KV[0:chunk] -> out0, lse0
+   +--> DCP rank1: attend KV[chunk:]  -> out1, lse1
+                      |
+               合并 LSE + output
+                      |
+                 全局 attention 输出</code></pre>
+
+        <p>这里不能简单把 <code>out0 + out1</code> 相加，因为 attention softmax 的分母跨完整上下文。每个 rank 必须返回局部 softmax LSE，最后用 LSE 正确合并局部 attention 状态。vLLM 因此要求 DCP 使用的 attention backend 能在 decode 阶段返回 softmax LSE。</p>
+
+        <p>DCP 的通信后端主要有两类：</p>
+
+<pre><code>ag_rs: AllGather + ReduceScatter
+a2a:   All-to-All 交换 partial outputs + LSE，再用 Triton kernel 合并</code></pre>
+
+        <h2>8. 组合关系</h2>
+
+        <p>这些策略不是互斥的。更准确地说，它们作用在不同层面：</p>
+
+<pre><code>DP: 复制多套服务副本，扩吞吐
+  └── PP: 每套副本内按层切模型
+        └── PCP: prefill 长上下文切分
+              └── TP: 每层权重/激活切分
+                    └── DCP: decode 时在 TP 内切上下文</code></pre>
+
+        <p>一个整体图可以这样看：</p>
+
+<pre><code>请求批次
+  |
+  +==================== DP rank 0 ====================+
+  | PP0 ----hidden----> PP1                            |
+  |  |                 |                               |
+  |  +-- PCP / TP / DCP +-- PCP / TP / DCP             |
+  +====================================================+
+  |
+  +==================== DP rank 1 ====================+
+  | PP0 ----hidden----> PP1                            |
+  |  |                 |                               |
+  |  +-- PCP / TP / DCP +-- PCP / TP / DCP             |
+  +====================================================+</code></pre>
+
+        <h2>9. 总结</h2>
+
+        <p>理解 vLLM 的分布式策略，关键不是背缩写，而是问每种策略切的是什么：</p>
+
+<pre><code>TP:  切同一层里的矩阵和激活
+PP:  切模型深度，把不同层放到不同 stage
+DP:  复制模型副本，把请求或 batch 分到不同副本
+SP:  在 TP 组内沿 token 维切激活，常用于编译优化或 MoE 去重
+PCP: prefill 阶段切长上下文，会增加 world_size
+DCP: decode 阶段切历史上下文，不增加 world_size，复用 TP ranks</code></pre>
+
+        <p>如果从推理生命周期看，也可以这样记：</p>
+
+<pre><code>模型太大放不下: 先看 TP，再看 PP
+请求吞吐不够:   看 DP
+prefill 太重:   看 PCP
+decode 长上下文慢: 看 DCP
+TP 内通信和 MoE 重复计算: 看 SP</code></pre>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <span>© 2026 zzzzzmeng</span>
+    </footer>
+  </body>
+</html>
