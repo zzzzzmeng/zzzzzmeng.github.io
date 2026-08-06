@@ -1,0 +1,724 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SGLang 与 vLLM main 实现深度对比框架 | zzzzzmeng</title>
+    <meta name="description" content="目标：先穷举可比维度，随后按条目 ID 逐项做源码级分析。">
+    <link rel="stylesheet" href="../assets/style.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="nav" aria-label="&#20027;&#23548;&#33322;">
+        <a class="brand" href="../">zzzzzmeng</a>
+        <div class="nav-links">
+          <a href="../">&#25991;&#31456;</a>
+          <a href="https://github.com/zzzzzmeng">GitHub</a>
+        </div>
+      </nav>
+    </header>
+
+    <main class="article article-wide">
+      <article>
+        <header class="article-header">
+          <p class="eyebrow">SGLang &middot; vLLM &middot; Inference Systems</p>
+          <h1>SGLang 与 vLLM <code>main</code> 实现深度对比框架</h1>
+          <p class="meta">2026-08-06</p>
+        </header>
+
+<blockquote>
+<p>状态：框架版 v0.1，尚不包含胜负结论。<br>基准日期：2026-08-06（Asia/Shanghai）。<br>目标：先穷举可比维度，随后按条目 ID 逐项做源码级分析。</p>
+</blockquote>
+<h2>1. 对比基线</h2>
+<p>本系列固定使用以下官方仓库提交，避免讨论过程中 <code>main</code> 漂移：</p>
+<table>
+<thead>
+<tr>
+<th>框架</th>
+<th>官方仓库</th>
+<th><code>main</code> 基准提交</th>
+<th>提交页</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>SGLang</td>
+<td><code>sgl-project/sglang</code></td>
+<td><code>c84ddc0e76a716634832acebb8c1fbe902ea5b7e</code></td>
+<td><a href="https://github.com/sgl-project/sglang/commit/c84ddc0e76a716634832acebb8c1fbe902ea5b7e">c84ddc0</a></td>
+</tr>
+<tr>
+<td>vLLM</td>
+<td><code>vllm-project/vllm</code></td>
+<td><code>8c0f029ac7718af4400d7542bb99417cb901d220</code></td>
+<td><a href="https://github.com/vllm-project/vllm/commit/8c0f029ac7718af4400d7542bb99417cb901d220">8c0f029</a></td>
+</tr>
+</tbody></table>
+<p>说明：</p>
+<ul>
+<li>当前工作区的 SGLang <code>HEAD</code> 是 <code>ae848116662ece923501131ce773a4602223237e</code>，早于上述官方基准；本文中的远端源码链接一律固定到基准 SHA。</li>
+<li>主线分析对象是 LLM/VLM 推理和在线服务核心。图像/视频生成、SGLang 前端语言、独立网关等非对称能力单列，不强行做一一对应。</li>
+<li>vLLM 以当前主路径 <code>vllm/v1</code> 为核心；只有当兼容层或旧路径仍被公共入口调用时，才纳入主调用链。</li>
+<li>“有同名功能”不等于“语义等价”。后续结论必须说明约束、默认值、回退路径、硬件范围和失败语义。</li>
+</ul>
+<h2>2. 分析规则</h2>
+<h3>2.1 每个条目的固定输出</h3>
+<p>后续逐项分析统一填写：</p>
+<ol>
+<li>问题定义与边界。</li>
+<li>SGLang 入口、核心类/函数、完整调用链。</li>
+<li>vLLM 入口、核心类/函数、完整调用链。</li>
+<li>核心状态、数据结构及其所有权。</li>
+<li>正常路径、回退路径、异常与取消路径。</li>
+<li>并发模型、同步点、CPU/GPU 通信和复杂度。</li>
+<li>配置项、默认值、自动选择逻辑和不兼容组合。</li>
+<li>正确性、性能、显存、可扩展性和工程权衡。</li>
+<li>支持矩阵：模型、量化、硬件、并行模式和部署形态。</li>
+<li>源码证据、测试证据、基准方案、结论与置信度。</li>
+</ol>
+<h3>2.2 证据等级</h3>
+<table>
+<thead>
+<tr>
+<th>等级</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>E0</td>
+<td>README、文档或 CLI 声明；只能证明对外宣称</td>
+</tr>
+<tr>
+<td>E1</td>
+<td>注册表、配置和静态源码入口；证明代码存在</td>
+</tr>
+<tr>
+<td>E2</td>
+<td>调用链、状态流和回退路径闭环；证明实际实现方式</td>
+</tr>
+<tr>
+<td>E3</td>
+<td>单元/集成测试覆盖；证明特定输入下的行为</td>
+</tr>
+<tr>
+<td>E4</td>
+<td>同环境可复现实验；证明当前软硬件组合下的正确性或性能</td>
+</tr>
+</tbody></table>
+<p>每条结论标注 <code>待分析 / 部分验证 / 已验证 / 不适用</code>，并至少达到 E2；性能结论必须达到 E4。</p>
+<h3>2.3 公平性约束</h3>
+<ul>
+<li>固定模型、权重格式、精度、上下文长度、输入/输出长度分布和随机种子。</li>
+<li>固定 GPU/CPU、驱动、CUDA/ROCm、PyTorch、通信库和容器环境。</li>
+<li>分开比较默认配置、对齐配置和各自最佳调优配置。</li>
+<li>同时报 TTFT、ITL/TPOT、E2E、吞吐、并发、P50/P95/P99、峰值显存和主机开销。</li>
+<li>区分冷启动、预热后、CUDA Graph/编译完成后和稳定高负载阶段。</li>
+<li>不把模型特化优化泛化为框架通用优势；不把暂未接入等同于架构不能支持。</li>
+</ul>
+<h2>3. 源码导航总表</h2>
+<table>
+<thead>
+<tr>
+<th>主题</th>
+<th>SGLang 基准入口</th>
+<th>vLLM 基准入口</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>服务与 API</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/entrypoints"><code>python/sglang/srt/entrypoints</code></a>, <a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/managers"><code>managers</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/entrypoints"><code>vllm/entrypoints</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/engine"><code>vllm/v1/engine</code></a></td>
+</tr>
+<tr>
+<td>调度</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/managers"><code>srt/managers</code></a>, <a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/batch_overlap"><code>batch_overlap</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/core"><code>vllm/v1/core</code></a></td>
+</tr>
+<tr>
+<td>KV 与内存</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/mem_cache"><code>srt/mem_cache</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/blob/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/kv_cache_interface.py"><code>vllm/v1/kv_cache_interface.py</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/core"><code>vllm/v1/core</code></a></td>
+</tr>
+<tr>
+<td>模型执行</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/model_executor"><code>srt/model_executor</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/worker"><code>vllm/v1/worker</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/model_executor"><code>model_executor</code></a></td>
+</tr>
+<tr>
+<td>Attention/算子</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/layers"><code>srt/layers</code></a>, <a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/kernels"><code>python/sglang/kernels</code></a>, <a href="https://github.com/sgl-project/sgl-kernel"><code>sgl-kernel</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/attention"><code>vllm/v1/attention</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/model_executor/layers"><code>model_executor/layers</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/kernels"><code>vllm/kernels</code></a></td>
+</tr>
+<tr>
+<td>分布式</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/distributed"><code>srt/distributed</code></a>, <a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/eplb"><code>srt/eplb</code></a>, <a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/elastic_ep"><code>elastic_ep</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/distributed"><code>vllm/distributed</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/executor"><code>vllm/v1/executor</code></a></td>
+</tr>
+<tr>
+<td>投机解码</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/speculative"><code>srt/speculative</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/spec_decode"><code>vllm/v1/spec_decode</code></a></td>
+</tr>
+<tr>
+<td>约束生成与解析</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/constrained"><code>srt/constrained</code></a>, <a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/function_call"><code>function_call</code></a>, <a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/parser"><code>parser</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/structured_output"><code>vllm/v1/structured_output</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/tool_parsers"><code>tool_parsers</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/reasoning"><code>reasoning</code></a></td>
+</tr>
+<tr>
+<td>解耦与 KV 传输</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/disaggregation"><code>srt/disaggregation</code></a>, <a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/connector"><code>srt/connector</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/distributed/kv_transfer"><code>distributed/kv_transfer</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/kv_offload"><code>vllm/v1/kv_offload</code></a></td>
+</tr>
+<tr>
+<td>模型与加载</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/models"><code>srt/models</code></a>, <a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/model_loader"><code>model_loader</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/model_executor/models"><code>vllm/model_executor/models</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/model_executor/model_loader"><code>model_loader</code></a></td>
+</tr>
+<tr>
+<td>多模态</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/multimodal"><code>srt/multimodal</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/multimodal"><code>vllm/multimodal</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/inputs"><code>vllm/inputs</code></a></td>
+</tr>
+<tr>
+<td>图像/视频生成</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/multimodal_gen"><code>python/sglang/multimodal_gen</code></a></td>
+<td>先判定同基准下是否存在同层级运行时，再决定可比范围</td>
+</tr>
+<tr>
+<td>平台与可观测性</td>
+<td><a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/platforms"><code>srt/platforms</code></a>, <a href="https://github.com/sgl-project/sglang/tree/c84ddc0e76a716634832acebb8c1fbe902ea5b7e/python/sglang/srt/observability"><code>observability</code></a></td>
+<td><a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/platforms"><code>vllm/platforms</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/v1/metrics"><code>vllm/v1/metrics</code></a>, <a href="https://github.com/vllm-project/vllm/tree/8c0f029ac7718af4400d7542bb99417cb901d220/vllm/tracing"><code>vllm/tracing</code></a></td>
+</tr>
+</tbody></table>
+<h2>4. 特性维度总览</h2>
+<table>
+<thead>
+<tr>
+<th>编号</th>
+<th>维度</th>
+<th>核心问题</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>A</td>
+<td>产品边界与公共接口</td>
+<td>两者究竟提供哪些推理任务、API 和编程模型？</td>
+</tr>
+<tr>
+<td>B</td>
+<td>总体架构与进程拓扑</td>
+<td>请求经过哪些进程、线程、队列和控制面？</td>
+</tr>
+<tr>
+<td>C</td>
+<td>请求预处理与输出链路</td>
+<td>从 HTTP/离线输入到 token，再到流式输出如何流转？</td>
+</tr>
+<tr>
+<td>D</td>
+<td>调度与连续批处理</td>
+<td>如何决定谁在何时以多少 token 进入一次迭代？</td>
+</tr>
+<tr>
+<td>E</td>
+<td>KV Cache 与内存系统</td>
+<td>如何分配、复用、淘汰、迁移和观测推理状态？</td>
+</tr>
+<tr>
+<td>F</td>
+<td>模型执行器与图编译</td>
+<td>forward、采样、CUDA Graph 和编译如何组织？</td>
+</tr>
+<tr>
+<td>G</td>
+<td>Attention 与算子后端</td>
+<td>后端如何选择，prefill/decode/MLA 等路径如何分化？</td>
+</tr>
+<tr>
+<td>H</td>
+<td>模型注册与权重加载</td>
+<td>新模型如何接入，权重如何发现、映射和装载？</td>
+</tr>
+<tr>
+<td>I</td>
+<td>量化与低精度</td>
+<td>量化配置、权重、激活、KV 和内核如何闭环？</td>
+</tr>
+<tr>
+<td>J</td>
+<td>并行、通信与 MoE</td>
+<td>TP/PP/DP/EP/CP 等如何组合和通信？</td>
+</tr>
+<tr>
+<td>K</td>
+<td>投机与高级解码</td>
+<td>draft、verify、接受采样和动态策略如何实现？</td>
+</tr>
+<tr>
+<td>L</td>
+<td>结构化输出、工具与推理解析</td>
+<td>grammar、tool call、reasoning 如何影响调度和采样？</td>
+</tr>
+<tr>
+<td>M</td>
+<td>多模态理解与非生成任务</td>
+<td>图像/视频/音频输入、encoder cache、embedding 等如何实现？</td>
+</tr>
+<tr>
+<td>N</td>
+<td>图像/视频生成运行时</td>
+<td>diffusion/VAE/VLA 等是否属于框架核心，如何调度优化？</td>
+</tr>
+<tr>
+<td>O</td>
+<td>Prefill/Decode 解耦与分层缓存</td>
+<td>KV 如何跨实例、跨设备和跨存储流动？</td>
+</tr>
+<tr>
+<td>P</td>
+<td>LoRA、动态权重与 RL</td>
+<td>如何热加载适配器、更新权重并服务训练工作流？</td>
+</tr>
+<tr>
+<td>Q</td>
+<td>硬件与平台抽象</td>
+<td>CUDA、ROCm、XPU、NPU、CPU 等如何复用或分叉？</td>
+</tr>
+<tr>
+<td>R</td>
+<td>可观测性、可靠性与安全</td>
+<td>如何发现、隔离、恢复和审计线上故障？</td>
+</tr>
+<tr>
+<td>S</td>
+<td>部署、测试、基准与生态</td>
+<td>如何交付、验证、压测和扩展框架？</td>
+</tr>
+</tbody></table>
+<h2>5. 逐项对比清单</h2>
+<p>以下复选框只表示分析进度；初始均为待分析。</p>
+<h3>A. 产品边界与公共接口</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>A01</strong> 推理任务矩阵：生成、embedding、pooling、score、rerank、分类及其他任务。</li>
+<li><input disabled="" type="checkbox"> <strong>A02</strong> 在线与离线 API：同步/异步引擎、批量输入、流式输出和取消接口。</li>
+<li><input disabled="" type="checkbox"> <strong>A03</strong> OpenAI 兼容面：Completions、Chat、Responses、Embeddings、Transcriptions 等端点及语义差异。</li>
+<li><input disabled="" type="checkbox"> <strong>A04</strong> 非 OpenAI 协议：Anthropic、Ollama、原生 HTTP、gRPC 或其他入口。</li>
+<li><input disabled="" type="checkbox"> <strong>A05</strong> 请求/响应数据模型：字段覆盖、默认值、校验、兼容字段与扩展字段。</li>
+<li><input disabled="" type="checkbox"> <strong>A06</strong> Sampling 参数：支持集合、优先级、互斥关系和默认行为。</li>
+<li><input disabled="" type="checkbox"> <strong>A07</strong> SGLang 前端语言与运行时协同；vLLM 是否存在等价编程抽象。</li>
+<li><input disabled="" type="checkbox"> <strong>A08</strong> 会话、多轮状态、prompt fork 和服务端状态管理。</li>
+<li><input disabled="" type="checkbox"> <strong>A09</strong> 插件体系：模型、平台、输入处理、解析器、算子和外部存储的扩展边界。</li>
+<li><input disabled="" type="checkbox"> <strong>A10</strong> 配置体系：CLI、Python、环境变量、配置文件的覆盖顺序和派生逻辑。</li>
+<li><input disabled="" type="checkbox"> <strong>A11</strong> 向后兼容与弃用策略：API、配置、序列化协议和旧引擎路径。</li>
+<li><input disabled="" type="checkbox"> <strong>A12</strong> 服务网关范围：单引擎、多副本路由、模型路由、限流和服务发现是否属于项目本体。</li>
+</ul>
+<h3>B. 总体架构与进程拓扑</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>B01</strong> 控制面与数据面的边界、状态所有权及生命周期。</li>
+<li><input disabled="" type="checkbox"> <strong>B02</strong> API server、tokenizer、scheduler、detokenizer、worker 的进程/线程拓扑。</li>
+<li><input disabled="" type="checkbox"> <strong>B03</strong> Engine core 的同步与异步架构，以及前后台事件循环。</li>
+<li><input disabled="" type="checkbox"> <strong>B04</strong> 进程间通信：队列、共享内存、ZeroMQ、RPC/gRPC、序列化和复制次数。</li>
+<li><input disabled="" type="checkbox"> <strong>B05</strong> 单 GPU、单机多 GPU、多机和多副本时拓扑如何变化。</li>
+<li><input disabled="" type="checkbox"> <strong>B06</strong> Data-parallel controller、负载路由和 engine rank 管理。</li>
+<li><input disabled="" type="checkbox"> <strong>B07</strong> tokenizer 放置、并行 tokenization 和 detokenization 放置。</li>
+<li><input disabled="" type="checkbox"> <strong>B08</strong> 调度与执行重叠：CPU 调度、GPU forward、采样、输出回传的流水化。</li>
+<li><input disabled="" type="checkbox"> <strong>B09</strong> 启动阶段：配置解析、模型探测、显存 profiling、进程拉起、warmup 和 graph capture。</li>
+<li><input disabled="" type="checkbox"> <strong>B10</strong> 停止阶段：排空、取消、子进程回收、通信组销毁和资源泄漏防护。</li>
+<li><input disabled="" type="checkbox"> <strong>B11</strong> Python、C++、CUDA、Rust 组件的职责边界和 ABI/API 稳定性。</li>
+<li><input disabled="" type="checkbox"> <strong>B12</strong> 核心对象状态机：请求、批次、worker、engine 和连接器的状态迁移。</li>
+<li><input disabled="" type="checkbox"> <strong>B13</strong> 多租户或多模型是否共享进程、GPU、cache 与控制面。</li>
+<li><input disabled="" type="checkbox"> <strong>B14</strong> 故障域：API、scheduler、worker、远端 KV、网关故障分别影响哪些请求。</li>
+</ul>
+<h3>C. 请求预处理与输出链路</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>C01</strong> 模型与 tokenizer 配置探测、<code>trust_remote_code</code> 和 revision 处理。</li>
+<li><input disabled="" type="checkbox"> <strong>C02</strong> chat template 选择、覆盖、内容格式与消息规范化。</li>
+<li><input disabled="" type="checkbox"> <strong>C03</strong> 文本 tokenization：批量化、异步化、缓存和超长输入处理。</li>
+<li><input disabled="" type="checkbox"> <strong>C04</strong> 直接 token IDs、prompt embeddings、encoder inputs 等非文本输入通路。</li>
+<li><input disabled="" type="checkbox"> <strong>C05</strong> 多模态占位符展开、processor 调用、输入哈希和 feature 对齐。</li>
+<li><input disabled="" type="checkbox"> <strong>C06</strong> 参数校验时机：API 层、engine 层、scheduler 层和 model runner 层。</li>
+<li><input disabled="" type="checkbox"> <strong>C07</strong> 请求 ID、trace context、租户、优先级、deadline 和自定义 header 的传播。</li>
+<li><input disabled="" type="checkbox"> <strong>C08</strong> prefix cache key：token、adapter、多模态输入、模型配置和 salt 的组成。</li>
+<li><input disabled="" type="checkbox"> <strong>C09</strong> 请求入队、背压、排队上限、拒绝策略和 admission control。</li>
+<li><input disabled="" type="checkbox"> <strong>C10</strong> 客户端断开、显式 abort、timeout 后的取消传播与 KV 回收。</li>
+<li><input disabled="" type="checkbox"> <strong>C11</strong> streaming：chunk 粒度、首包、增量 detokenization、Unicode 边界和 SSE 行为。</li>
+<li><input disabled="" type="checkbox"> <strong>C12</strong> logprobs、prompt logprobs、top-k logprobs 和 token rank 的计算位置。</li>
+<li><input disabled="" type="checkbox"> <strong>C13</strong> stop token/string、bad words、min tokens 和终止原因的一致性。</li>
+<li><input disabled="" type="checkbox"> <strong>C14</strong> usage 统计：prompt/cache/generated/speculative token 的口径与流式上报。</li>
+<li><input disabled="" type="checkbox"> <strong>C15</strong> 批量请求部分失败、重试和顺序保持语义。</li>
+</ul>
+<h3>D. 调度与连续批处理</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>D01</strong> scheduler 核心数据结构、一次 step 的输入输出和时间复杂度。</li>
+<li><input disabled="" type="checkbox"> <strong>D02</strong> continuous batching 的请求加入/退出时机。</li>
+<li><input disabled="" type="checkbox"> <strong>D03</strong> prefill 与 decode 混批策略及资源竞争。</li>
+<li><input disabled="" type="checkbox"> <strong>D04</strong> chunked prefill 的切分规则、token budget、阈值和默认启用条件。</li>
+<li><input disabled="" type="checkbox"> <strong>D05</strong> 长 prompt 与短请求的公平性、head-of-line blocking 和 starvation 防护。</li>
+<li><input disabled="" type="checkbox"> <strong>D06</strong> FCFS、优先级、deadline、SLO 或自定义策略的实现与稳定性。</li>
+<li><input disabled="" type="checkbox"> <strong>D07</strong> GPU token budget、sequence budget、encoder budget 和显存预算的协同。</li>
+<li><input disabled="" type="checkbox"> <strong>D08</strong> preemption：recompute、swap、暂停/恢复及被抢占请求的状态保存。</li>
+<li><input disabled="" type="checkbox"> <strong>D09</strong> prefix-aware 调度：cache 命中是否影响选择、排序和跨 worker 路由。</li>
+<li><input disabled="" type="checkbox"> <strong>D10</strong> async scheduling/overlap scheduling 的滞后一拍状态、收益和限制。</li>
+<li><input disabled="" type="checkbox"> <strong>D11</strong> batch invariant 操作、确定性以及批次形状变化的影响。</li>
+<li><input disabled="" type="checkbox"> <strong>D12</strong> CUDA Graph bucket 与调度 batch shape 的协同。</li>
+<li><input disabled="" type="checkbox"> <strong>D13</strong> sliding-window、Mamba/SSM、hybrid model 的 cache budget 调度。</li>
+<li><input disabled="" type="checkbox"> <strong>D14</strong> 多模态 encoder 调度、encoder cache 命中和输入预算。</li>
+<li><input disabled="" type="checkbox"> <strong>D15</strong> structured output grammar 尚未编译完成时的阻塞/跳过策略。</li>
+<li><input disabled="" type="checkbox"> <strong>D16</strong> speculative decoding 的 draft token budget、verify 长度和调度整合。</li>
+<li><input disabled="" type="checkbox"> <strong>D17</strong> pipeline parallel 的 microbatch 划分、bubble 和输出排序。</li>
+<li><input disabled="" type="checkbox"> <strong>D18</strong> data-parallel rank 选择、负载估计、sticky routing 和迁移。</li>
+<li><input disabled="" type="checkbox"> <strong>D19</strong> Prefill/Decode 解耦模式下的准入、bootstrap 和 KV 就绪协调。</li>
+<li><input disabled="" type="checkbox"> <strong>D20</strong> 调度开销剖析：Python 对象、锁、队列、批处理 metadata 和 CPU 瓶颈。</li>
+</ul>
+<h3>E. KV Cache 与内存系统</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>E01</strong> 基本抽象：page/block、token slot、layer spec、cache group 和请求映射。</li>
+<li><input disabled="" type="checkbox"> <strong>E02</strong> PagedAttention block table 与 radix tree/prefix tree 的核心差异。</li>
+<li><input disabled="" type="checkbox"> <strong>E03</strong> prefix cache 的插入、匹配、引用计数、锁定与释放生命周期。</li>
+<li><input disabled="" type="checkbox"> <strong>E04</strong> block/page size 对碎片、kernel、命中率和调度粒度的影响。</li>
+<li><input disabled="" type="checkbox"> <strong>E05</strong> 物理分配器、空闲表、连续性要求、对齐和碎片整理。</li>
+<li><input disabled="" type="checkbox"> <strong>E06</strong> 淘汰策略：LRU、优先级、树节点粒度、可驱逐条件和开销。</li>
+<li><input disabled="" type="checkbox"> <strong>E07</strong> cache hash：哈希算法、碰撞处理、跨进程稳定性与安全 salt。</li>
+<li><input disabled="" type="checkbox"> <strong>E08</strong> full attention、sliding window、local attention、Mamba/SSM 的混合 cache。</li>
+<li><input disabled="" type="checkbox"> <strong>E09</strong> MLA 的 latent KV 布局、吸收路径和普通 MHA/GQA 布局差异。</li>
+<li><input disabled="" type="checkbox"> <strong>E10</strong> KV dtype：FP16/BF16/FP8/其他低精度的元数据、scale 和 kernel 约束。</li>
+<li><input disabled="" type="checkbox"> <strong>E11</strong> KV 初始化时的显存 profiling、可用块数计算和冗余预留。</li>
+<li><input disabled="" type="checkbox"> <strong>E12</strong> host CPU offload、pinned memory、异步拷贝和带宽隐藏。</li>
+<li><input disabled="" type="checkbox"> <strong>E13</strong> 多级/分层缓存：GPU、CPU、NVMe、远端存储的索引与一致性。</li>
+<li><input disabled="" type="checkbox"> <strong>E14</strong> 外部 KV connector/store 的接口、插件注册和能力协商。</li>
+<li><input disabled="" type="checkbox"> <strong>E15</strong> 跨实例 KV 传输的数据布局、metadata、zero-copy/RDMA 和完成通知。</li>
+<li><input disabled="" type="checkbox"> <strong>E16</strong> session cache、prompt fork、共享前缀和 copy-on-write 语义。</li>
+<li><input disabled="" type="checkbox"> <strong>E17</strong> cache flush、模型/adapter 更新后的失效规则和竞态处理。</li>
+<li><input disabled="" type="checkbox"> <strong>E18</strong> VMM/虚拟内存、稀疏 KV、压缩 KV 或其他实验性内存机制。</li>
+<li><input disabled="" type="checkbox"> <strong>E19</strong> 多模态 processor/encoder cache 与文本 KV cache 的边界。</li>
+<li><input disabled="" type="checkbox"> <strong>E20</strong> cache 观测：使用率、命中率、驱逐、等待、传输和逐请求事件。</li>
+</ul>
+<h3>F. 模型执行器与图编译</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>F01</strong> worker/model runner 初始化、device 绑定和分布式组创建。</li>
+<li><input disabled="" type="checkbox"> <strong>F02</strong> scheduler output 到 GPU input buffer/forward metadata 的转换。</li>
+<li><input disabled="" type="checkbox"> <strong>F03</strong> prefill、decode、extend、pooling 等 forward mode 的统一与分支。</li>
+<li><input disabled="" type="checkbox"> <strong>F04</strong> 输入张量准备：padding、packing、position、slot mapping 和异步 H2D。</li>
+<li><input disabled="" type="checkbox"> <strong>F05</strong> forward context、attention metadata 和 layer 间状态传递。</li>
+<li><input disabled="" type="checkbox"> <strong>F06</strong> CUDA Graph：full/piecewise、capture bucket、padding、重放和回退。</li>
+<li><input disabled="" type="checkbox"> <strong>F07</strong> <code>torch.compile</code>/Dynamo/Inductor：图切分、custom op、缓存与动态形状。</li>
+<li><input disabled="" type="checkbox"> <strong>F08</strong> 编译与 graph capture 的启动成本、持久化和模型切换影响。</li>
+<li><input disabled="" type="checkbox"> <strong>F09</strong> eager mode 与 compiled/graph mode 的行为一致性和限制。</li>
+<li><input disabled="" type="checkbox"> <strong>F10</strong> logits processor、vocab-parallel gather、采样前张量布局和精度。</li>
+<li><input disabled="" type="checkbox"> <strong>F11</strong> GPU sampling、CPU sampling、异步输出处理和同步点。</li>
+<li><input disabled="" type="checkbox"> <strong>F12</strong> pipeline intermediate tensors、PP stage 边界和最后 stage 输出。</li>
+<li><input disabled="" type="checkbox"> <strong>F13</strong> pooling/embedding/score 的执行路径与生成路径复用程度。</li>
+<li><input disabled="" type="checkbox"> <strong>F14</strong> sleep/wake、内存释放、权重 reload 和 runner 重建。</li>
+<li><input disabled="" type="checkbox"> <strong>F15</strong> Model Runner V2/runner backend 等新旧执行路径的选择和成熟度。</li>
+<li><input disabled="" type="checkbox"> <strong>F16</strong> 每 step 临时张量、buffer 复用、内存峰值和 Python/CUDA launch 开销。</li>
+</ul>
+<h3>G. Attention 与算子后端</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>G01</strong> attention backend 注册、自动选择、显式覆盖与回退优先级。</li>
+<li><input disabled="" type="checkbox"> <strong>G02</strong> backend capability 声明：硬件、dtype、head size、block size、mask 和 graph。</li>
+<li><input disabled="" type="checkbox"> <strong>G03</strong> prefill、decode、extend 的 kernel 分派和 metadata 差异。</li>
+<li><input disabled="" type="checkbox"> <strong>G04</strong> FlashAttention、FlashInfer、Triton、Torch SDPA、AITER 等后端接入方式。</li>
+<li><input disabled="" type="checkbox"> <strong>G05</strong> PagedAttention 读写 KV、block table 格式和 kernel ABI。</li>
+<li><input disabled="" type="checkbox"> <strong>G06</strong> MHA、MQA、GQA、MLA/MHA absorb 的实现与选择。</li>
+<li><input disabled="" type="checkbox"> <strong>G07</strong> sliding-window、local、cross、encoder-decoder attention。</li>
+<li><input disabled="" type="checkbox"> <strong>G08</strong> sparse attention、indexer、DSA 或模型特化稀疏路径。</li>
+<li><input disabled="" type="checkbox"> <strong>G09</strong> linear attention、Mamba/SSM、GDN 等非标准序列层。</li>
+<li><input disabled="" type="checkbox"> <strong>G10</strong> cascade attention、prefix 共享优化和多 query 复用。</li>
+<li><input disabled="" type="checkbox"> <strong>G11</strong> context/sequence parallel 下 attention 的切分与通信。</li>
+<li><input disabled="" type="checkbox"> <strong>G12</strong> FP8/量化 KV attention 的 scale、布局与数值误差。</li>
+<li><input disabled="" type="checkbox"> <strong>G13</strong> CUDA Graph 对 attention backend 和动态 metadata 的限制。</li>
+<li><input disabled="" type="checkbox"> <strong>G14</strong> RoPE、Q/K norm、cache write 等融合边界。</li>
+<li><input disabled="" type="checkbox"> <strong>G15</strong> dense GEMM、MoE GEMM、norm、activation、sampling 等非 attention kernel 栈。</li>
+<li><input disabled="" type="checkbox"> <strong>G16</strong> 自研 kernel、第三方 kernel、编译扩展和预编译 wheel 的维护方式。</li>
+<li><input disabled="" type="checkbox"> <strong>G17</strong> kernel autotune、缓存、硬件特化 dispatch 和性能回退。</li>
+<li><input disabled="" type="checkbox"> <strong>G18</strong> kernel 正确性、容差、确定性和跨后端一致性测试。</li>
+</ul>
+<h3>H. 模型注册与权重加载</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>H01</strong> model architecture registry、别名、任务判定和 lazy import。</li>
+<li><input disabled="" type="checkbox"> <strong>H02</strong> Hugging Face config/Transformers 版本适配与自定义 config。</li>
+<li><input disabled="" type="checkbox"> <strong>H03</strong> Transformers-native/fallback model 路径及与原生实现的性能差异。</li>
+<li><input disabled="" type="checkbox"> <strong>H04</strong> 新模型接入接口：模型类、层抽象、权重映射和并行切分。</li>
+<li><input disabled="" type="checkbox"> <strong>H05</strong> safetensors、PyTorch、GGUF、分片 checkpoint 等格式加载。</li>
+<li><input disabled="" type="checkbox"> <strong>H06</strong> weight iterator、远端下载、流式加载、mmap 和 host 内存峰值。</li>
+<li><input disabled="" type="checkbox"> <strong>H07</strong> tensor parallel 权重切分、stacked parameter 和 packed module 映射。</li>
+<li><input disabled="" type="checkbox"> <strong>H08</strong> pipeline parallel 缺失层、dummy layer 和参数归属。</li>
+<li><input disabled="" type="checkbox"> <strong>H09</strong> quantized checkpoint 探测、配置覆盖和在线量化/转换。</li>
+<li><input disabled="" type="checkbox"> <strong>H10</strong> tied embeddings、共享权重、expert 权重和模型特化映射。</li>
+<li><input disabled="" type="checkbox"> <strong>H11</strong> 多模态 processor/model 注册与语言模型核心的耦合。</li>
+<li><input disabled="" type="checkbox"> <strong>H12</strong> pooling/embedding/rerank 模型适配和输出 head。</li>
+<li><input disabled="" type="checkbox"> <strong>H13</strong> Mamba/混合架构、MoE、MLA 等非标准模型接入成本。</li>
+<li><input disabled="" type="checkbox"> <strong>H14</strong> 模型支持矩阵的生成方式、测试层级和“可启动/可正确/已优化”的区别。</li>
+<li><input disabled="" type="checkbox"> <strong>H15</strong> 外部插件模型和不修改核心仓库的扩展能力。</li>
+</ul>
+<h3>I. 量化与低精度</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>I01</strong> quantization config registry、自动探测、显式覆盖和兼容性校验。</li>
+<li><input disabled="" type="checkbox"> <strong>I02</strong> weight-only INT8/INT4、AWQ、GPTQ、Marlin、bitsandbytes、GGUF 等路径。</li>
+<li><input disabled="" type="checkbox"> <strong>I03</strong> FP8、MXFP8、MXFP4、NVFP4、ModelOpt 等浮点/微缩放格式。</li>
+<li><input disabled="" type="checkbox"> <strong>I04</strong> activation quantization：静态/动态、per-token/per-tensor 和 scale 传播。</li>
+<li><input disabled="" type="checkbox"> <strong>I05</strong> KV cache 量化及其与 attention backend 的组合矩阵。</li>
+<li><input disabled="" type="checkbox"> <strong>I06</strong> dense linear、embedding、LM head 和 Conv 等层的量化覆盖。</li>
+<li><input disabled="" type="checkbox"> <strong>I07</strong> MoE router/expert/shared expert 的量化与 fused MoE kernel。</li>
+<li><input disabled="" type="checkbox"> <strong>I08</strong> checkpoint 原生量化、加载时转换和运行时在线量化的差异。</li>
+<li><input disabled="" type="checkbox"> <strong>I09</strong> scale/zero-point 布局、权重重排、padding 和序列化兼容。</li>
+<li><input disabled="" type="checkbox"> <strong>I10</strong> 硬件 capability 与 kernel dispatch；不支持时的报错或回退。</li>
+<li><input disabled="" type="checkbox"> <strong>I11</strong> TP/EP/PP、LoRA、spec decode、CUDA Graph 与量化的组合限制。</li>
+<li><input disabled="" type="checkbox"> <strong>I12</strong> 数值精度、校准、容差和参考实现对照测试。</li>
+<li><input disabled="" type="checkbox"> <strong>I13</strong> autotune、workspace、预处理成本和首次请求延迟。</li>
+<li><input disabled="" type="checkbox"> <strong>I14</strong> 量化插件接口与第三方后端的版本耦合。</li>
+</ul>
+<h3>J. 并行、通信与 MoE</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>J01</strong> tensor parallel 的层切分、collective 和 vocab parallel。</li>
+<li><input disabled="" type="checkbox"> <strong>J02</strong> pipeline parallel 的 stage 划分、microbatch、调度与 bubble。</li>
+<li><input disabled="" type="checkbox"> <strong>J03</strong> data parallel 的副本组织、路由、global/local rank 和同步需求。</li>
+<li><input disabled="" type="checkbox"> <strong>J04</strong> expert parallel 的 expert 放置、token dispatch/combine 和容量管理。</li>
+<li><input disabled="" type="checkbox"> <strong>J05</strong> context/sequence parallel、decode context parallel 及其他上下文切分。</li>
+<li><input disabled="" type="checkbox"> <strong>J06</strong> TP/PP/DP/EP/CP 的可组合矩阵与约束检查。</li>
+<li><input disabled="" type="checkbox"> <strong>J07</strong> process group 初始化、rank 编排、device mesh 和子通信组。</li>
+<li><input disabled="" type="checkbox"> <strong>J08</strong> NCCL/RCCL/oneCCL/HCCL/Gloo 等通信后端抽象。</li>
+<li><input disabled="" type="checkbox"> <strong>J09</strong> custom all-reduce、reduce-scatter、all-gather、all-to-all kernel。</li>
+<li><input disabled="" type="checkbox"> <strong>J10</strong> 通信与计算重叠、双 batch overlap 和 stream/event 管理。</li>
+<li><input disabled="" type="checkbox"> <strong>J11</strong> DeepEP、MORI 或其他 MoE 通信库接入及回退。</li>
+<li><input disabled="" type="checkbox"> <strong>J12</strong> expert load balancing：统计、重排、冗余 expert 和在线更新。</li>
+<li><input disabled="" type="checkbox"> <strong>J13</strong> elastic expert parallel/弹性伸缩时的状态迁移与请求影响。</li>
+<li><input disabled="" type="checkbox"> <strong>J14</strong> heterogeneous placement、节点拓扑、NVLink/PCIe/IB 感知。</li>
+<li><input disabled="" type="checkbox"> <strong>J15</strong> Ray、原生 multiprocessing、外部 launcher 的 executor 差异。</li>
+<li><input disabled="" type="checkbox"> <strong>J16</strong> 多机 bootstrap、地址发现、超时、重试和网络分区行为。</li>
+<li><input disabled="" type="checkbox"> <strong>J17</strong> collective 死锁检测、worker crash 传播和局部恢复。</li>
+<li><input disabled="" type="checkbox"> <strong>J18</strong> 分布式下随机性、采样、batch invariant 和结果确定性。</li>
+<li><input disabled="" type="checkbox"> <strong>J19</strong> 分布式指标聚合、逐 rank profiling 和瓶颈定位。</li>
+<li><input disabled="" type="checkbox"> <strong>J20</strong> dense 模型与 MoE 模型在调度、内存和通信上的专用优化边界。</li>
+</ul>
+<h3>K. 投机与高级解码</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>K01</strong> 支持算法清单及准确命名：draft model、EAGLE、MTP、n-gram 等。</li>
+<li><input disabled="" type="checkbox"> <strong>K02</strong> proposer/draft worker 与 target worker 的进程和设备部署。</li>
+<li><input disabled="" type="checkbox"> <strong>K03</strong> draft token 生成、树结构/线性结构和 metadata 表示。</li>
+<li><input disabled="" type="checkbox"> <strong>K04</strong> target verify 的 batch 构造、ragged verify 和 attention 路径。</li>
+<li><input disabled="" type="checkbox"> <strong>K05</strong> rejection/typical sampling、接受概率、bonus token 和数值稳定性。</li>
+<li><input disabled="" type="checkbox"> <strong>K06</strong> greedy 与随机采样下的分布等价性和随机数管理。</li>
+<li><input disabled="" type="checkbox"> <strong>K07</strong> 动态 speculation 长度、接受率反馈和自适应策略。</li>
+<li><input disabled="" type="checkbox"> <strong>K08</strong> draft/target tokenizer、vocab、TP、量化和模型结构兼容。</li>
+<li><input disabled="" type="checkbox"> <strong>K09</strong> multi-layer draft、共享权重、共享 KV 或 hidden state 的实现。</li>
+<li><input disabled="" type="checkbox"> <strong>K10</strong> speculative CUDA Graph capture、bucket 和 fallback。</li>
+<li><input disabled="" type="checkbox"> <strong>K11</strong> continuous batching 下不同请求 draft 长度和完成状态的压缩。</li>
+<li><input disabled="" type="checkbox"> <strong>K12</strong> structured output、logprobs、stop strings、LoRA 和多模态组合。</li>
+<li><input disabled="" type="checkbox"> <strong>K13</strong> Prefill/Decode 解耦与 speculative worker 的组合。</li>
+<li><input disabled="" type="checkbox"> <strong>K14</strong> 接受率、draft 开销、有效 token/s 和额外显存的指标口径。</li>
+<li><input disabled="" type="checkbox"> <strong>K15</strong> 失败回退到普通 decode 时的透明性和状态清理。</li>
+</ul>
+<h3>L. 结构化输出、工具与推理解析</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>L01</strong> JSON schema、regex、EBNF/grammar、choice 等约束表达能力。</li>
+<li><input disabled="" type="checkbox"> <strong>L02</strong> grammar backend、FSM/token mask 表示和 tokenizer 适配。</li>
+<li><input disabled="" type="checkbox"> <strong>L03</strong> grammar 编译的同步/异步执行、缓存 key、容量和驱逐。</li>
+<li><input disabled="" type="checkbox"> <strong>L04</strong> 每步 token mask 应用位置、GPU/CPU 开销和 batch 合并。</li>
+<li><input disabled="" type="checkbox"> <strong>L05</strong> 空语言、非法 schema、不可达状态和超时的失败语义。</li>
+<li><input disabled="" type="checkbox"> <strong>L06</strong> grammar 与 chunked prefill、async scheduling、spec decode 的交互。</li>
+<li><input disabled="" type="checkbox"> <strong>L07</strong> tool parser 注册、模型方言、parallel tool calls 和增量解析。</li>
+<li><input disabled="" type="checkbox"> <strong>L08</strong> reasoning parser：思维内容与最终答案的切分及流式边界。</li>
+<li><input disabled="" type="checkbox"> <strong>L09</strong> chat template、tool schema 注入和 assistant message 重建。</li>
+<li><input disabled="" type="checkbox"> <strong>L10</strong> OpenAI Responses/Chat 在 tool、reasoning、structured output 上的字段映射。</li>
+<li><input disabled="" type="checkbox"> <strong>L11</strong> parser 插件扩展、版本兼容和模型自动选择。</li>
+<li><input disabled="" type="checkbox"> <strong>L12</strong> malformed output 的容错、回退和 finish reason。</li>
+<li><input disabled="" type="checkbox"> <strong>L13</strong> 正确性测试：schema coverage、Unicode、递归结构和随机采样分布。</li>
+</ul>
+<h3>M. 多模态理解与非生成任务</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>M01</strong> 多模态输入注册、processor 抽象和模型侧接口。</li>
+<li><input disabled="" type="checkbox"> <strong>M02</strong> 图片、视频、音频、文档等 modality 的支持边界与输入格式。</li>
+<li><input disabled="" type="checkbox"> <strong>M03</strong> URL/base64/local path 拉取、大小限制、安全校验和解码。</li>
+<li><input disabled="" type="checkbox"> <strong>M04</strong> placeholder/token expansion 与 encoder feature 对齐。</li>
+<li><input disabled="" type="checkbox"> <strong>M05</strong> processor cache、输入 hash、跨请求共享与失效。</li>
+<li><input disabled="" type="checkbox"> <strong>M06</strong> encoder cache 的分配、调度、驱逐和多层内存。</li>
+<li><input disabled="" type="checkbox"> <strong>M07</strong> 不同图片数/分辨率/帧数请求的动态 batching。</li>
+<li><input disabled="" type="checkbox"> <strong>M08</strong> encoder 与 language model 的设备放置、并行和流水重叠。</li>
+<li><input disabled="" type="checkbox"> <strong>M09</strong> multimodal CUDA Graph、动态 shape 和 padding 策略。</li>
+<li><input disabled="" type="checkbox"> <strong>M10</strong> 多模态 prefix caching 与文本 KV cache key 的绑定。</li>
+<li><input disabled="" type="checkbox"> <strong>M11</strong> embedding、pooling、score、rerank、classification 的输入和输出语义。</li>
+<li><input disabled="" type="checkbox"> <strong>M12</strong> cross-encoder、dual-encoder 和生成模型复用执行器的程度。</li>
+<li><input disabled="" type="checkbox"> <strong>M13</strong> 模型/processor 兼容矩阵与 Transformers 版本漂移。</li>
+<li><input disabled="" type="checkbox"> <strong>M14</strong> 多模态准确性、预处理一致性、batch invariance 和性能基准。</li>
+</ul>
+<h3>N. 图像/视频生成运行时</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>N01</strong> 两个仓库在基准提交下是否都有同层级 diffusion/生成运行时；先判定可比性。</li>
+<li><input disabled="" type="checkbox"> <strong>N02</strong> pipeline、scheduler、transformer/UNet、VAE、text encoder 的对象模型。</li>
+<li><input disabled="" type="checkbox"> <strong>N03</strong> 图像/视频/VLA 等任务入口、请求模型和流式/预览输出。</li>
+<li><input disabled="" type="checkbox"> <strong>N04</strong> 多请求 batching、分辨率/帧数 bucket 和 admission control。</li>
+<li><input disabled="" type="checkbox"> <strong>N05</strong> tensor/context/sequence/data parallel 在生成 pipeline 中的实现。</li>
+<li><input disabled="" type="checkbox"> <strong>N06</strong> cache：prompt embedding、encoder、transformer residual、VAE 等缓存。</li>
+<li><input disabled="" type="checkbox"> <strong>N07</strong> full/breakable CUDA Graph 与动态 step/shape。</li>
+<li><input disabled="" type="checkbox"> <strong>N08</strong> attention/GEMM/conv kernel 后端和硬件选择。</li>
+<li><input disabled="" type="checkbox"> <strong>N09</strong> FP8/INT8/INT4 等量化范围和质量影响。</li>
+<li><input disabled="" type="checkbox"> <strong>N10</strong> pipeline disaggregation、远程阶段和中间状态传输。</li>
+<li><input disabled="" type="checkbox"> <strong>N11</strong> realtime、WebUI、ComfyUI 或其他应用集成是否属于核心能力。</li>
+<li><input disabled="" type="checkbox"> <strong>N12</strong> 后训练、采样配置和推理运行时的代码边界。</li>
+<li><input disabled="" type="checkbox"> <strong>N13</strong> 质量指标、确定性、端到端延迟、吞吐和峰值显存基准。</li>
+</ul>
+<h3>O. Prefill/Decode 解耦与分层缓存</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>O01</strong> PD disaggregation 的角色、状态机和请求生命周期。</li>
+<li><input disabled="" type="checkbox"> <strong>O02</strong> prefill/decode 实例发现、路由、负载信息和 sticky session。</li>
+<li><input disabled="" type="checkbox"> <strong>O03</strong> bootstrap 元数据、请求标识、token 一致性和握手协议。</li>
+<li><input disabled="" type="checkbox"> <strong>O04</strong> KV/hidden state 的传输单位、布局、分片和序列化。</li>
+<li><input disabled="" type="checkbox"> <strong>O05</strong> NIXL、Mooncake、MORI、NCCL/RDMA/共享内存等 connector 能力矩阵。</li>
+<li><input disabled="" type="checkbox"> <strong>O06</strong> connector 抽象层次、插件注册、能力协商和版本兼容。</li>
+<li><input disabled="" type="checkbox"> <strong>O07</strong> push/pull、同步/异步、轮询/回调及 completion 管理。</li>
+<li><input disabled="" type="checkbox"> <strong>O08</strong> KV 尚未就绪时 decode scheduler 的等待、跳过和超时。</li>
+<li><input disabled="" type="checkbox"> <strong>O09</strong> partial prefill、部分 KV 命中和剩余 token 本地计算。</li>
+<li><input disabled="" type="checkbox"> <strong>O10</strong> 多机、多 NIC、分片 KV 和 TP/DP/EP 组合。</li>
+<li><input disabled="" type="checkbox"> <strong>O11</strong> 远端 KV store、分层 cache、tenant ID 和命名空间隔离。</li>
+<li><input disabled="" type="checkbox"> <strong>O12</strong> 背压、流控、限速、拥塞和传输队列内存上限。</li>
+<li><input disabled="" type="checkbox"> <strong>O13</strong> prefill/decode/connector 任一失败时的重试、回退和清理。</li>
+<li><input disabled="" type="checkbox"> <strong>O14</strong> 弹性扩缩容、节点替换、cache warming 和一致性。</li>
+<li><input disabled="" type="checkbox"> <strong>O15</strong> TTFT/ITL、传输带宽、队列时间、命中率和成本的端到端观测。</li>
+</ul>
+<h3>P. LoRA、动态权重与 RL</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>P01</strong> LoRA 注册、加载、激活、卸载和 adapter ID 生命周期。</li>
+<li><input disabled="" type="checkbox"> <strong>P02</strong> 单 batch 多 LoRA、请求路由和 kernel metadata。</li>
+<li><input disabled="" type="checkbox"> <strong>P03</strong> LoRA rank、target module、bias、embedding/LM head 和 packed module 支持。</li>
+<li><input disabled="" type="checkbox"> <strong>P04</strong> LoRA cache、显存/主存容量、LRU 和并发加载。</li>
+<li><input disabled="" type="checkbox"> <strong>P05</strong> LoRA kernel 后端及与 TP、PP、量化、CUDA Graph 的组合。</li>
+<li><input disabled="" type="checkbox"> <strong>P06</strong> 动态权重更新/weight sync 的 API、通信组和一致性边界。</li>
+<li><input disabled="" type="checkbox"> <strong>P07</strong> 更新过程中在途请求看到旧权重还是新权重，是否具备原子切换。</li>
+<li><input disabled="" type="checkbox"> <strong>P08</strong> 更新后 KV、CUDA Graph、编译缓存和量化 metadata 的失效。</li>
+<li><input disabled="" type="checkbox"> <strong>P09</strong> checkpoint engine、远端 checkpoint、增量加载和回滚。</li>
+<li><input disabled="" type="checkbox"> <strong>P10</strong> sleep/wake 级别、权重/KV/临时 buffer 释放和恢复延迟。</li>
+<li><input disabled="" type="checkbox"> <strong>P11</strong> RL rollout 接口、trainer 集成、权重广播和 colocated deployment。</li>
+<li><input disabled="" type="checkbox"> <strong>P12</strong> rollout 的 logprobs、随机种子、确定性和训练所需元数据。</li>
+<li><input disabled="" type="checkbox"> <strong>P13</strong> state capture、请求回放、故障恢复和调试快照。</li>
+<li><input disabled="" type="checkbox"> <strong>P14</strong> 多租户 adapter/权重访问控制、来源校验和资源配额。</li>
+</ul>
+<h3>Q. 硬件与平台抽象</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>Q01</strong> platform 探测、注册、lazy import 和配置派生。</li>
+<li><input disabled="" type="checkbox"> <strong>Q02</strong> NVIDIA CUDA 支持层级：compute capability、CUDA 版本和特化 kernel。</li>
+<li><input disabled="" type="checkbox"> <strong>Q03</strong> AMD ROCm：AITER/CK/FlashAttention、RCCL 和功能差距。</li>
+<li><input disabled="" type="checkbox"> <strong>Q04</strong> Intel XPU：attention、quantization、graph 和 oneCCL 支持。</li>
+<li><input disabled="" type="checkbox"> <strong>Q05</strong> Ascend NPU/CANN：运行时、HCCL、算子和模型差异。</li>
+<li><input disabled="" type="checkbox"> <strong>Q06</strong> CPU：ISA、oneDNN/AMX、内存管理、线程和分布式支持。</li>
+<li><input disabled="" type="checkbox"> <strong>Q07</strong> TPU、MPS/MLX、MUSA 或其他平台在基准提交下的实际状态。</li>
+<li><input disabled="" type="checkbox"> <strong>Q08</strong> device-neutral 接口与平台专用 fork/mixin 的边界。</li>
+<li><input disabled="" type="checkbox"> <strong>Q09</strong> dtype、量化、attention、spec decode、LoRA 的跨平台能力矩阵。</li>
+<li><input disabled="" type="checkbox"> <strong>Q10</strong> graph/compile 抽象在 CUDA Graph、XPU Graph 等平台上的复用。</li>
+<li><input disabled="" type="checkbox"> <strong>Q11</strong> 源码构建、条件依赖、预编译 wheel、JIT kernel 和 ABI。</li>
+<li><input disabled="" type="checkbox"> <strong>Q12</strong> 容器镜像、驱动兼容、架构标签和镜像体积。</li>
+<li><input disabled="" type="checkbox"> <strong>Q13</strong> 平台 CI 矩阵、nightly 覆盖和长期无人覆盖路径。</li>
+<li><input disabled="" type="checkbox"> <strong>Q14</strong> 同一语义在不同平台的回退、警告、错误和精度一致性。</li>
+</ul>
+<h3>R. 可观测性、可靠性与安全</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>R01</strong> Prometheus 指标命名、标签基数、直方图 bucket 和兼容性。</li>
+<li><input disabled="" type="checkbox"> <strong>R02</strong> scheduler、KV、model runner、connector、spec decode 的内部指标覆盖。</li>
+<li><input disabled="" type="checkbox"> <strong>R03</strong> OpenTelemetry tracing、跨进程 context 和逐请求 timeline。</li>
+<li><input disabled="" type="checkbox"> <strong>R04</strong> 结构化日志、request ID、rank 信息、采样与日志量控制。</li>
+<li><input disabled="" type="checkbox"> <strong>R05</strong> CPU/GPU profiler、在线触发、范围标记和多 rank 汇总。</li>
+<li><input disabled="" type="checkbox"> <strong>R06</strong> debug dump、输入捕获、schedule simulator、comparator 和可重放性。</li>
+<li><input disabled="" type="checkbox"> <strong>R07</strong> liveness、readiness、model health 和依赖服务健康检查。</li>
+<li><input disabled="" type="checkbox"> <strong>R08</strong> watchdog、卡死检测、collective timeout 和 worker crash 传播。</li>
+<li><input disabled="" type="checkbox"> <strong>R09</strong> OOM 预防、运行时 OOM、碎片化和失败请求资源回收。</li>
+<li><input disabled="" type="checkbox"> <strong>R10</strong> 请求取消、异常、客户端断开时的 KV、grammar、adapter 清理。</li>
+<li><input disabled="" type="checkbox"> <strong>R11</strong> graceful shutdown、滚动升级、排空和未完成请求语义。</li>
+<li><input disabled="" type="checkbox"> <strong>R12</strong> overload protection、队列上限、速率限制、优先级反转和降级。</li>
+<li><input disabled="" type="checkbox"> <strong>R13</strong> fault tolerance：worker/engine/节点故障后的恢复粒度和状态丢失。</li>
+<li><input disabled="" type="checkbox"> <strong>R14</strong> API key、TLS、CORS、allowed origins 和管理端点隔离。</li>
+<li><input disabled="" type="checkbox"> <strong>R15</strong> URL 媒体抓取、SSRF、文件路径、大小/类型限制和解压炸弹防护。</li>
+<li><input disabled="" type="checkbox"> <strong>R16</strong> remote code、pickle、动态插件、自定义模型/算子的供应链风险。</li>
+<li><input disabled="" type="checkbox"> <strong>R17</strong> prompt/output 日志、metrics label、trace 中的敏感数据和脱敏。</li>
+<li><input disabled="" type="checkbox"> <strong>R18</strong> tenant 隔离：cache key、远端 KV、LoRA、权重和资源配额。</li>
+<li><input disabled="" type="checkbox"> <strong>R19</strong> 可复现性：版本、环境采集、seed、batch invariance 和确定性开关。</li>
+<li><input disabled="" type="checkbox"> <strong>R20</strong> 安全公告、依赖扫描、权限边界和默认暴露面。</li>
+</ul>
+<h3>S. 部署、测试、基准与生态</h3>
+<ul>
+<li><input disabled="" type="checkbox"> <strong>S01</strong> 安装方式、Python/CUDA/PyTorch 版本约束和依赖冲突面。</li>
+<li><input disabled="" type="checkbox"> <strong>S02</strong> CLI 易用性、配置发现、启动诊断和错误消息质量。</li>
+<li><input disabled="" type="checkbox"> <strong>S03</strong> Docker、Kubernetes、Helm、KServe、Ray Serve 等部署资产。</li>
+<li><input disabled="" type="checkbox"> <strong>S04</strong> 多副本网关、负载均衡、服务发现、自动扩缩和模型路由。</li>
+<li><input disabled="" type="checkbox"> <strong>S05</strong> 云厂商、模型仓库、对象存储和外部 KV 生态集成。</li>
+<li><input disabled="" type="checkbox"> <strong>S06</strong> 公共 Python API 稳定性、类型标注和下游扩展成本。</li>
+<li><input disabled="" type="checkbox"> <strong>S07</strong> 单元、集成、端到端、模型、kernel、分布式测试的目录与分层。</li>
+<li><input disabled="" type="checkbox"> <strong>S08</strong> CI 按硬件/模型/功能的覆盖矩阵、触发频率和 flaky 管理。</li>
+<li><input disabled="" type="checkbox"> <strong>S09</strong> correctness oracle：Transformers/reference、逐 token、logprob 和统计分布对照。</li>
+<li><input disabled="" type="checkbox"> <strong>S10</strong> benchmark 工具的 workload、数据集、随机过程和输出指标可比性。</li>
+<li><input disabled="" type="checkbox"> <strong>S11</strong> 离线吞吐、在线吞吐、单请求延迟和并发曲线。</li>
+<li><input disabled="" type="checkbox"> <strong>S12</strong> TTFT、ITL/TPOT、E2E、P50/P95/P99 和超时/失败率。</li>
+<li><input disabled="" type="checkbox"> <strong>S13</strong> prefix cache 命中、chunked prefill、长上下文和混合长度 workload。</li>
+<li><input disabled="" type="checkbox"> <strong>S14</strong> speculative acceptance、有效吞吐、额外显存和功耗。</li>
+<li><input disabled="" type="checkbox"> <strong>S15</strong> PD 解耦、跨机 KV、分层缓存的带宽、扩展性和尾延迟。</li>
+<li><input disabled="" type="checkbox"> <strong>S16</strong> dense/MoE、文本/VLM、短/长上下文、不同量化的场景矩阵。</li>
+<li><input disabled="" type="checkbox"> <strong>S17</strong> 冷启动、模型加载、compile、graph capture、warmup 和首个可服务时间。</li>
+<li><input disabled="" type="checkbox"> <strong>S18</strong> 峰值/稳态 GPU 显存、host 内存、CPU 利用率、网络和功耗。</li>
+<li><input disabled="" type="checkbox"> <strong>S19</strong> release cadence、变更规模、文档同步、issue/PR 响应等维护性指标。</li>
+<li><input disabled="" type="checkbox"> <strong>S20</strong> 结论外推边界：哪些结果只适用于特定提交、模型、硬件或 workload。</li>
+</ul>
+<h2>6. 建议的深入讨论顺序</h2>
+<p>为了先建立主干认知，建议按以下顺序推进：</p>
+<ol>
+<li><strong>B02 → B03 → B04 → C09 → D01</strong>：画出完整请求与进程调用链。</li>
+<li><strong>D03 → D04 → D08 → D10 → D20</strong>：比较调度器的核心设计。</li>
+<li><strong>E01 → E02 → E03 → E06 → E13</strong>：比较 Paged KV 与 Radix/Prefix Cache。</li>
+<li><strong>F02 → F06 → F07 → F11</strong>：比较执行器、CUDA Graph、编译与采样。</li>
+<li><strong>G01 → G03 → G05 → G06</strong>：比较 attention 抽象和关键 kernel ABI。</li>
+<li><strong>J01 → J04 → J10 → J12</strong>：比较并行、MoE 通信和负载均衡。</li>
+<li>再按需求进入 <strong>K/L/M/O/P/Q</strong> 等专项。</li>
+<li>最后用 <strong>S09–S18</strong> 建立可复现基准，验证前面得到的实现判断。</li>
+</ol>
+<p>如果更关注线上选型，可以改用：<code>A → R → O → S → D/E/F</code>。如果更关注内核学习，可以改用：<code>F → G → I → J → E/D</code>。</p>
+<h2>7. 单条分析记录模板</h2>
+<p>复制以下模板并以条目 ID 命名：</p>
+<pre><code class="language-markdown">### D04：Chunked prefill
+
+- 状态：待分析
+- 结论摘要：
+- 适用范围：
+- 证据等级：
+
+#### SGLang
+
+- 公共入口：
+- 核心调用链：
+- 核心状态/数据结构：
+- 默认与回退：
+
+#### vLLM
+
+- 公共入口：
+- 核心调用链：
+- 核心状态/数据结构：
+- 默认与回退：
+
+#### 差异与权衡
+
+- 正确性语义：
+- CPU/GPU/显存成本：
+- 并发与扩展性：
+- 模型/硬件/功能组合限制：
+- 运维与可观测性：
+
+#### 验证
+
+- 源码证据：
+- 测试证据：
+- 实验设计与结果：
+- 未决问题：
+</code></pre>
+<h2>8. 维护约定</h2>
+<ul>
+<li>深入分析仍引用本文件顶部的固定提交；不悄悄切换到更新的 <code>main</code>。</li>
+<li>若需要更新基线，新建版本并记录两个仓库的 SHA、日期和受影响条目。</li>
+<li>每完成一项，将复选框勾选并在独立章节或文件中链接对应分析。</li>
+<li>支持矩阵必须注明“代码存在、测试通过、官方声明、实测通过”中的哪一层。</li>
+<li>结论使用可证伪描述，例如“在 H200、BF16、该 workload 下 P99 更低”，不用笼统的“更快/更强”。</li>
+</ul>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <span>&copy; 2026 zzzzzmeng</span>
+    </footer>
+  </body>
+</html>
