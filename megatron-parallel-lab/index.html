@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="逐帧观察 Megatron 训练中的矩阵分片、GPU 分工和集合通信。">
+<title>Megatron 并行实验室</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="partitions.css">
+<link rel="stylesheet" href="implementation.css">
+<body>
+<header class="top"><div class="brand"><span class="logo">▦</span> Megatron <span class="light">并行实验室</span></div><span class="top-label">分布式训练 / 交互导读</span></header>
+<main>
+<section class="intro"><div class="eyebrow">MEGATRON FIELD NOTES <span> / </span> 01</div><h1>一层模型，<br>多张卡怎么算<span class="question">？</span></h1><p>把矩阵拆开，跟着数据走。逐帧观察每张 GPU 拿到什么、在算什么，以及何时必须等其他 GPU。</p><div class="intro-grid" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></section>
+<section class="lab" aria-label="并行模拟器">
+<div class="lab-top"><span class="eyebrow">01 / 选择并行策略</span><nav id="modes" aria-label="并行策略"></nav></div>
+<div class="workspace">
+<div class="stage">
+<div class="stage-head"><div><div class="eyebrow" id="tag"></div><h2 id="name"></h2><p id="overview"></p></div><label class="case-label" id="caseLabel" for="cases">示例<select id="cases"></select></label></div>
+<section class="split-panel" aria-labelledby="split-title">
+<div class="split-head"><div><div class="eyebrow">切分示意 / PARTITION MAP</div><h3 id="split-title">原始布局 → 各卡持有</h3></div><div class="split-key"><span class="key0">GPU 0</span><span class="key1">GPU 1</span></div></div>
+<div id="splits"></div>
+</section>
+<div class="canvas"><div class="canvas-head"><span>逐帧张量视图</span><span id="phase"></span></div><p class="axis-guide">矩阵的行列含义随张量而变。X 的行是 token、列是特征；数学权重 W 的行是输入特征、列是输出特征。悬停可查看坐标。</p><div id="matrices"></div><div id="wire"></div><div id="cards"></div></div>
+<section class="execution" aria-live="polite"><h3>这一步怎样算</h3><div id="execution"></div><div id="scalar"></div><div id="pipeline"></div></section>
+<div class="controls"><button id="prev" aria-label="上一步">←</button><button id="play">▶ 播放</button><button id="next" aria-label="下一步">→</button><button id="reset" aria-label="回到起点" title="回到起点">↺</button><span id="counter"></span><input id="seek" type="range" min="0" value="0" aria-label="步骤进度"></div>
+</div>
+<aside class="side"><div class="eyebrow">02 / 单步追踪</div><div id="phase-nav" role="group" aria-label="跳到计算阶段"><button id="forward">→ 前向</button><button id="backward">← 反向</button></div><div id="inspector" aria-live="polite"></div><div id="steps"></div></aside>
+</div>
+</section>
+<section class="source-panel"><div class="eyebrow">03 / 对照 MEGATRON 实现</div><h2 id="source-title"></h2><div id="contract"></div><details open><summary>源码关键调用与中文注释</summary><p id="source-route"></p><pre><code id="source-code"></code></pre><a id="source-link" target="_blank" rel="noopener">打开对应源码 ↗</a><p id="source-foot"></p></details><p class="source-version">核对本地 Megatron-LM · 581248531 · 教学代码节选省略其他配置分支，链接定位到同一 commit。</p></section>
+<section class="legend"><div><h2>先问三个问题</h2><p>区分并行策略时，先看切分对象、当前 rank 的职责，以及通信发生的位置。</p></div><div><b>01 / 切什么</b><p>特征、样本、层、序列还是专家？</p></div><div><b>02 / 算什么</b><p>本地结果是完整分片，还是部分和？</p></div><div><b>03 / 传什么</b><p>激活、梯度、KV，还是路由后的 token？</p></div></section>
+<footer><a href="../">← 返回技术博客</a><span>教学模拟 · 使用小矩阵与简化调度</span> <a href="https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core">Megatron Core 源码 ↗</a></footer>
+</main>
+<script src="sim.js"></script>
+<script src="split-diagrams.js"></script>
+<script src="backprop.js"></script>
+<script src="implementation.js"></script>
+<script src="ui.js"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+.source-panel,.execution {border:1px solid var(--edge);border-radius:10px;padding:16px;margin-top:18px;background:#151a1c}
+.source-panel h2{margin:6px 0 14px;font-size:22px}
+.source-panel pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid var(--edge);background:#0e1214;padding:15px;border-radius:7px;color:#bde6cb;font-size:13px}
+.source-panel summary{cursor:pointer;font-weight:700;margin-top:16px}
+.source-panel p,.axis-guide{font-size:12px;color:var(--muted)}
+.contract-row{display:grid;grid-template-columns:90px 1fr;gap:12px;padding:8px 0;border-bottom:1px solid var(--edge);font-size:13px}
+.execution h3{margin:0 0 10px;font-size:17px}
+#execution{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.exec-card{display:grid;gap:7px;border-left:3px solid var(--gpu);padding:9px;background:#1d2527}
+.exec-card.selected{outline:1px solid var(--gpu)}
+.exec-card strong{font-size:13px}
+.exec-detail,.exec-comm{grid-column:1/-1;font-size:13px;margin:2px 0}
+.exec-comm{color:var(--amber)}
+#scalar{border-top:1px solid var(--edge);margin-top:12px;padding-top:10px;font-size:13px}
+#scalar .formula{margin-top:7px}
+.timeline{width:100%;margin-top:15px;border-collapse:collapse;font:11px ui-monospace,monospace}
+.timeline td,.timeline th{border:1px solid var(--edge);text-align:center;padding:9px 3px}
+.timeline .bwd{color:var(--violet)}.timeline .fwd{color:var(--mint)}.timeline .active{background:#35453d;outline:1px solid var(--mint)}
+.matrix:focus-within{outline:1px solid var(--mint)}
+@media(max-width:550px){#execution{grid-template-columns:1fr}.timeline td,.timeline th{padding:7px 1px;font-size:9px}.contract-row{grid-template-columns:65px 1fr}}
