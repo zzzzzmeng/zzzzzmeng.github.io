@@ -7,10 +7,27 @@
 <link rel="stylesheet" href="style.css">
 <link rel="stylesheet" href="partitions.css">
 <link rel="stylesheet" href="implementation.css">
+<link rel="stylesheet" href="intro.css">
 <body>
 <header class="top"><div class="brand"><span class="logo">▦</span> Megatron <span class="light">并行实验室</span></div><span class="top-label">分布式训练 / 交互导读</span></header>
 <main>
-<section class="intro"><div class="eyebrow">MEGATRON FIELD NOTES <span> / </span> 01</div><h1>一层模型，<br>多张卡怎么算<span class="question">？</span></h1><p>把矩阵拆开，跟着数据走。逐帧观察每张 GPU 拿到什么、在算什么，以及何时必须等其他 GPU。</p><div class="intro-grid" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></section>
+<section class="intro intro-v2">
+  <div class="intro-copy">
+    <div class="eyebrow">交互式学习 / MEGATRON CORE</div>
+    <h1>看懂 Megatron<br><span>分布式训练</span></h1>
+    <p>从一个矩阵到多张 GPU，理解模型如何切分、计算与通信。切换六种并行策略，跟随前向计算和反向梯度，逐步对照源码。</p>
+    <div class="intro-actions"><a class="start-link" href="#modes">开始探索 <span aria-hidden="true">↗</span></a><span class="intro-note">先选策略，再逐步播放</span></div>
+  </div>
+  <div class="learning-map" aria-label="学习路径">
+    <div class="map-caption">一次训练，四个观察角度</div>
+    <ol>
+      <li><span class="map-number">01</span><div><strong>切分</strong><span>每张卡持有哪些数据和权重</span></div></li>
+      <li><span class="map-number">02</span><div><strong>计算</strong><span>局部矩阵如何得到输出</span></div></li>
+      <li><span class="map-number">03</span><div><strong>通信</strong><span>结果何时拼接、何时求和</span></div></li>
+      <li><span class="map-number">04</span><div><strong>反向</strong><span>梯度如何回传与累积</span></div></li>
+    </ol>
+  </div>
+</section>
 <section class="lab" aria-label="并行模拟器">
 <div class="lab-top"><span class="eyebrow">01 / 选择并行策略</span><nav id="modes" aria-label="并行策略"></nav></div>
 <div class="workspace">
